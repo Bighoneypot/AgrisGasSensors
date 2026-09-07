@@ -1,10 +1,10 @@
 
 // =====================================================================
 // MYRUMINET - Sensore Gas Stalla
-// FIRMWARE v6.3 FINAL - SENSORI SEMPRE ON + PREHEAT CONDIZIONALE
+// FIRMWARE v6.5.2 - RAK13009 LOW POWER + PREHEAT + WDT + SETUP FIX
 // =====================================================================
 // RAK3172-E / RAK19007 Rev.C
-// RAK1920 Sensor Adapter (3V3 sempre alimentato - bug schematico)
+// RAK13009 QWIIC Module (3V3_S controllato via WB_IO2)
 // BME680 + DFRobot NH3 + DFRobot H2S
 //
 // LoRaWAN OTAA - EU868
@@ -13,10 +13,31 @@
 //
 // RUI 4.2.4
 //
+// CHANGELOG v6.5.2:
+// - FIX SETUP: rimosso preheat dal setup. Il setup ora fa solo:
+//   1. Join OTAA
+//   2. Se join OK -> esce dal setup
+//   3. Il primo ciclo di lettura avviene nel loop() con il flusso
+//      corretto: powerOn -> stabilizzazione -> preheat -> recovery -> lettura -> TX -> powerOff -> sleep
+//   Questo elimina il bug del doppio preheat e del join asincrono
+//   che interrompeva il preheat nel setup.
+//
+// CHANGELOG v6.5.1:
+// - FIX: Aggiunto delay 500ms dopo sensorPowerOn() prima di I2C recovery
+// - FIX: I2C bus recovery con retry (fino a 3 tentativi, delay crescente)
+//
+// CHANGELOG v6.5:
+// - RAK13009 sostituisce RAK1920 (risolto bug 3V3/3V3_S unite)
+// - ENABLE_PREHEAT = true (sensori disalimentati durante sleep)
+// - Risparmio energetico reale: sensori OFF durante deep sleep
+//
+// CHANGELOG v6.4:
+// - Aggiunto Software Watchdog Timer (WDT) basato su RUI3 timer
+// - Aggiunto I2C bus recovery (9 clock pulses) prima di ogni init I2C
+//
 // NOTE:
-// - La RAK1920 ha 3V3 e 3V3_S unite: sensori sempre alimentati
-// - ENABLE_PREHEAT = false -> sensori sempre caldi, no preheat
-// - ENABLE_PREHEAT = true  -> quando si risolve il power-off (RAK13009/MOSFET)
+// - RAK13009: 3V3_S controllato da WB_IO2 (HIGH=ON, LOW=OFF)
+// - ENABLE_PREHEAT = true -> sensori spenti in sleep, preriscaldo al wake
 // - Divisore batteria RAK19007 Rev.C: 2.265
 // - Con pannello solare 6W + batteria 10Ah = autonomia infinita
 // =====================================================================
@@ -33,9 +54,9 @@
 // =====================================================================
 
 // Abilitare il preriscaldamento sensori?
-// false: sensori sempre alimentati (RAK1920 bug, no power-off)
-// true:  sensori vengono spenti e riaccesi (RAK13009 o MOSFET esterno)
-#define ENABLE_PREHEAT     false
+// false: sensori sempre alimentati (bypass power-off, debug)
+// true:  sensori vengono spenti e riaccesi (RAK13009 via WB_IO2)
+#define ENABLE_PREHEAT     true
 
 // Preriscaldamento sensori gas in MINUTI (usato solo se ENABLE_PREHEAT = true)
 // Produzione: 5    Debug: 1
@@ -43,10 +64,33 @@
 
 // Sleep in MINUTI tra un invio e l'altro
 // Produzione: 25   Debug: 3
-#define SLEEP_MINUTES      30
+// NOTA: ciclo totale = SLEEP + PREHEAT
+#define SLEEP_MINUTES      25
 
 // Retry join in MINUTI
 #define JOIN_RETRY_MINUTES 5
+
+// =====================================================================
+// WATCHDOG TIMER - SOFTWARE WDT
+// =====================================================================
+// Timeout massimo per la fase attiva (lettura sensori + TX).
+// Se superato = hang → reboot automatico.
+// Produzione: 120000 (120 sec)   Debug: 60000 (60 sec)
+#define WDT_TIMEOUT_MS     120000UL   // 120 secondi
+
+// Timer RUI3 dedicato al WDT (RAK_TIMER_4 per evitare conflitti)
+#define WDT_TIMER_ID       RAK_TIMER_4
+
+
+// =====================================================================
+// I2C RECOVERY - CONFIGURAZIONE
+// =====================================================================
+// Numero massimo di tentativi di recovery I2C
+#define I2C_RECOVERY_MAX_RETRIES   3
+
+// Delay dopo accensione 3V3_S prima di tentare I2C (ms)
+// I sensori necessitano tempo per stabilizzarsi dopo power-on
+#define SENSOR_POWERUP_DELAY_MS    500
 
 
 // --- FORMULE AUTOMATICHE (NON MODIFICARE) ---
@@ -103,6 +147,10 @@ uint8_t node_app_key[16] = {0xAC, 0x1F, 0x09, 0xFF, 0xFE, 0x0A, 0x70, 0xF4,
 #define JOIN_POLL_INTERVAL 5000
 #define JOIN_MAX_POLLS     30
 
+// I2C Bus Recovery pins (RAK3172-E default I2C)
+#define I2C_SDA_PIN        PA11
+#define I2C_SCL_PIN        PA12
+
 
 // =====================================================================
 // OGGETTI GLOBALI
@@ -121,6 +169,7 @@ bool nh3_ok = false;
 bool h2s_ok = false;
 bool bme680_ok = false;
 bool joined = false;
+volatile bool wdt_active = false;
 
 
 // =====================================================================
@@ -147,9 +196,166 @@ void buildPayload(float temp, float hum, float pres, uint32_t voc, float nh3, fl
 uint16_t readBatteryMV(void);
 uint8_t estimateSOC(uint16_t mv);
 
+// WDT functions
+void wdtStart(void);
+void wdtStop(void);
+void wdtCallback(void *data);
+
+// I2C Recovery (con retry)
+bool i2cBusRecovery(void);
+bool i2cBusRecoveryWithRetry(void);
+
 
 // =====================================================================
-// SETUP
+// WATCHDOG TIMER - IMPLEMENTAZIONE
+// =====================================================================
+
+/**
+ * Callback WDT: scatta se la fase attiva supera WDT_TIMEOUT_MS.
+ * Esegue un reboot forzato del dispositivo.
+ */
+void wdtCallback(void *data) {
+  (void)data;
+  Serial.println();
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.println("  [WDT] TIMEOUT! Sistema bloccato!");
+  Serial.println("  [WDT] Reboot automatico in corso...");
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.flush();
+  delay(100);
+  api.system.reboot();
+}
+
+/**
+ * Avvia il software WDT. Da chiamare all'inizio della fase attiva.
+ */
+void wdtStart(void) {
+  api.system.timer.start(WDT_TIMER_ID, WDT_TIMEOUT_MS, NULL);
+  wdt_active = true;
+  Serial.print("[WDT] Avviato (timeout ");
+  Serial.print(WDT_TIMEOUT_MS / 1000);
+  Serial.println(" sec)");
+}
+
+/**
+ * Ferma il software WDT. Da chiamare prima del deep sleep.
+ */
+void wdtStop(void) {
+  if (wdt_active) {
+    api.system.timer.stop(WDT_TIMER_ID);
+    wdt_active = false;
+    Serial.println("[WDT] Fermato (sleep sicuro)");
+  }
+}
+
+
+// =====================================================================
+// I2C BUS RECOVERY (con retry e delay crescente)
+// =====================================================================
+
+/**
+ * Esegue un singolo tentativo di recovery del bus I2C con 9 clock pulses.
+ * Ritorna true se SDA e' stata rilasciata (o era gia' HIGH).
+ */
+bool i2cBusRecovery(void) {
+  Wire.end();
+  delay(10);
+
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+
+  // Controlla se SDA e' bloccata bassa
+  if (digitalRead(I2C_SDA_PIN) == LOW) {
+    Serial.println("[I2C] SDA bloccata LOW! Recovery in corso...");
+
+    // 9 clock pulses per sbloccare il bus
+    for (int i = 0; i < 9; i++) {
+      digitalWrite(I2C_SCL_PIN, HIGH);
+      delayMicroseconds(5);
+      digitalWrite(I2C_SCL_PIN, LOW);
+      delayMicroseconds(5);
+    }
+
+    // Genera STOP condition
+    pinMode(I2C_SDA_PIN, OUTPUT);
+    digitalWrite(I2C_SDA_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SDA_PIN, HIGH);
+    delayMicroseconds(5);
+
+    // Verifica
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    if (digitalRead(I2C_SDA_PIN) == HIGH) {
+      Serial.println("[I2C] Recovery OK - SDA rilasciata");
+      pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+      pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+      delay(10);
+      return true;
+    } else {
+      Serial.println("[I2C] Recovery FALLITA - SDA ancora LOW");
+      pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+      pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+      delay(10);
+      return false;
+    }
+  } else {
+    Serial.println("[I2C] Bus OK (SDA HIGH)");
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+    delay(10);
+    return true;
+  }
+}
+
+/**
+ * Esegue la recovery I2C con retry e delay crescente.
+ * Tentativo 1: recovery + 200ms
+ * Tentativo 2: recovery + 500ms
+ * Tentativo 3: recovery + 1000ms
+ * Ritorna true se il bus e' stato recuperato.
+ */
+bool i2cBusRecoveryWithRetry(void) {
+  const unsigned int retryDelays[I2C_RECOVERY_MAX_RETRIES] = {200, 500, 1000};
+
+  for (int attempt = 0; attempt < I2C_RECOVERY_MAX_RETRIES; attempt++) {
+    Serial.print("[I2C] Tentativo recovery ");
+    Serial.print(attempt + 1);
+    Serial.print("/");
+    Serial.println(I2C_RECOVERY_MAX_RETRIES);
+
+    if (i2cBusRecovery()) {
+      return true;
+    }
+
+    if (attempt < I2C_RECOVERY_MAX_RETRIES - 1) {
+      Serial.print("[I2C] Attendo ");
+      Serial.print(retryDelays[attempt]);
+      Serial.println(" ms prima di riprovare...");
+      delay(retryDelays[attempt]);
+    }
+  }
+
+  Serial.println("[I2C] !!! Recovery FALLITA dopo tutti i tentativi !!!");
+  Serial.println("[I2C] I sensori I2C potrebbero non funzionare.");
+  return false;
+}
+
+
+// =====================================================================
+// SETUP - SOLO JOIN, NIENTE SENSORI
+// =====================================================================
+// Il setup si occupa SOLO di:
+// 1. Inizializzazione hardware e WDT
+// 2. Configurazione LoRaWAN
+// 3. Join OTAA
+//
+// I sensori vengono gestiti ESCLUSIVAMENTE nel loop() con il flusso:
+// powerOn -> stabilizzazione -> preheat -> I2C recovery -> init -> lettura -> TX -> powerOff -> sleep
+//
+// Questo evita il bug del doppio preheat e del join asincrono
+// che interrompeva il preheat nel setup della v6.5.1.
 // =====================================================================
 
 void setup() {
@@ -160,11 +366,12 @@ void setup() {
 
   Serial.println();
   Serial.println("=============================================");
-  Serial.println("  MYRUMINET - SENSORE GAS STALLA v6.3");
-  Serial.println("  RAK3172-E / RAK19007 Rev.C / RAK1920");
+  Serial.println("  MYRUMINET - SENSORE GAS STALLA v6.5.2");
+  Serial.println("  RAK3172-E / RAK19007 Rev.C / RAK13009");
   Serial.println("  BME680 + NH3 + H2S");
   Serial.println("  LoRaWAN OTAA - EU868 - fPort 77");
   Serial.println("  RUI 4.2.4");
+  Serial.println("  SOFTWARE WDT ATTIVO");
   #if ENABLE_PREHEAT
     Serial.println("  MODALITA: PREHEAT ATTIVO (power-off sensori)");
     Serial.print("  PREHEAT: ");
@@ -179,17 +386,28 @@ void setup() {
   Serial.print("  CICLO:   ");
   Serial.print(CYCLE_TOTAL_MIN);
   Serial.println(" min totale");
+  Serial.print("  WDT:     ");
+  Serial.print(WDT_TIMEOUT_MS / 1000);
+  Serial.println(" sec timeout");
   Serial.print("  JOIN RETRY: ");
   Serial.print(JOIN_RETRY_MINUTES);
   Serial.println(" min");
   Serial.println("=============================================");
   Serial.println();
 
+  // ---- Creazione timer WDT (one-shot) ----
+  if (!api.system.timer.create(WDT_TIMER_ID, wdtCallback, RAK_TIMER_ONESHOT)) {
+    Serial.println("[WDT] ERRORE creazione timer!");
+  } else {
+    Serial.println("[WDT] Timer creato (one-shot, pronto)");
+  }
+  Serial.println();
+
   #if ENABLE_PREHEAT
-    // Sensori SPENTI fino a join riuscito
+    // Sensori SPENTI fino al primo ciclo nel loop
     pinMode(SENSOR_POWER_PIN, OUTPUT);
     digitalWrite(SENSOR_POWER_PIN, LOW);
-    Serial.println("[PWR] 3V3_S SPENTO (sensori OFF fino a join)");
+    Serial.println("[PWR] 3V3_S SPENTO (sensori OFF fino al primo ciclo)");
     Serial.println();
   #endif
 
@@ -211,47 +429,32 @@ void setup() {
     return;
   }
 
-  // Join riuscito
-  #if ENABLE_PREHEAT
-    sensorPowerOn();
-  #endif
-
-  // I2C
-  Wire.begin();
-  delay(100);
-  Serial.println("[I2C] Bus inizializzato");
-  Serial.println();
-
-  #if ENABLE_PREHEAT
-    Serial.print("[PWR] Preriscaldo iniziale sensori (");
-    Serial.print(PREHEAT_MINUTES);
-    Serial.println(" min)...");
-    preheatWait();
-    Serial.println("[PWR] Preriscaldo completato");
-    Serial.println();
-  #endif
-
-  // Init sensori
-  doInitSensors();
-
+  // Join riuscito - il loop fara' il primo ciclo completo
   Serial.println();
   Serial.println("=============================================");
-  Serial.println("  SETUP COMPLETATO - v6.3");
+  Serial.println("  SETUP COMPLETATO - v6.5.2");
+  Serial.println("  Join OK. Primo ciclo sensori nel loop.");
   Serial.println("=============================================");
   Serial.println();
 }
 
 
 // =====================================================================
-// LOOP
+// LOOP - CICLO COMPLETO: POWER -> PREHEAT -> LETTURA -> TX -> SLEEP
 // =====================================================================
 
 void loop() {
+
+  // ===== AVVIO WDT - INIZIO FASE ATTIVA =====
+  wdtStart();
 
   // ----- VERIFICA JOIN -----
   if (!api.lorawan.njs.get()) {
     Serial.println("[LORA] Sessione LoRaWAN non presente.");
     joined = false;
+
+    // Ferma WDT durante il join (può durare fino a 150s)
+    wdtStop();
     joinNetwork();
 
     if (!joined) {
@@ -263,22 +466,39 @@ void loop() {
       api.system.sleep.all(JOIN_RETRY_INTERVAL);
       return;
     }
+
+    // Join riuscito, riavvia WDT per fase sensori
+    wdtStart();
   } else {
     joined = true;
   }
 
-  // ----- SENSORI: ACCENSIONE + PREHEAT (solo se abilitato) -----
+  // ----- SENSORI: ACCENSIONE + STABILIZZAZIONE + PREHEAT -----
   #if ENABLE_PREHEAT
     sensorPowerOn();
+
+    // Delay di stabilizzazione dopo power-on
+    Serial.print("[PWR] Attendo stabilizzazione sensori (");
+    Serial.print(SENSOR_POWERUP_DELAY_MS);
+    Serial.println(" ms)...");
+    delay(SENSOR_POWERUP_DELAY_MS);
+
     Serial.print("[PWR] Preriscaldo sensori (");
     Serial.print(PREHEAT_MINUTES);
     Serial.println(" min)...");
+
+    // Ferma WDT durante preheat (dura minuti)
+    wdtStop();
     preheatWait();
     Serial.println("[PWR] Preriscaldo completato");
     Serial.println();
+
+    // Riavvia WDT per fase lettura
+    wdtStart();
   #endif
 
-  // ----- I2C + INIT SENSORI -----
+  // ----- I2C BUS RECOVERY CON RETRY + INIT SENSORI -----
+  i2cBusRecoveryWithRetry();
   Wire.begin();
   delay(100);
   doInitSensors();
@@ -372,8 +592,11 @@ void loop() {
   delay(6000);
 
   // =================================================================
-  // SLEEP
+  // STOP WDT + SLEEP
   // =================================================================
+
+  // ===== FERMA WDT PRIMA DI DORMIRE =====
+  wdtStop();
 
   Serial.println();
   Serial.print("[SLEEP] Deep sleep ");
@@ -384,7 +607,7 @@ void loop() {
   Wire.end();
 
   #if ENABLE_PREHEAT
-    // Spegni sensori (solo se abbiamo power control)
+    // Spegni sensori (RAK13009 - WB_IO2 LOW -> 3V3_S OFF)
     sensorPowerOff();
   #endif
 
