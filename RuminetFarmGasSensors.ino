@@ -1,7 +1,7 @@
 
 // =====================================================================
 // MYRUMINET - Sensore Gas Stalla
-// FIRMWARE v6.5.2 - RAK13009 LOW POWER + PREHEAT + WDT + SETUP FIX
+// FIRMWARE v6.5.3 - RAK13009 LOW POWER + PREHEAT + WDT FIX + SAFETY
 // =====================================================================
 // RAK3172-E / RAK19007 Rev.C
 // RAK13009 QWIIC Module (3V3_S controllato via WB_IO2)
@@ -12,6 +12,21 @@
 // fPort 77
 //
 // RUI 4.2.4
+//
+// CHANGELOG v6.5.3:
+// - FIX CRITICO: WDT ora resta SEMPRE attivo durante il preheat.
+//   Aggiunta funzione wdtKick() che fa restart del timer WDT.
+//   preheatWait() chiama wdtKick() ad ogni blocco di 30 sec.
+//   Se delay(30000) si blocca, il WDT resetta dopo 120 sec.
+//
+// - FIX CRITICO: WDT callback ora spegne 3V3_S (sensori OFF)
+//   PRIMA del reboot. Evita che i sensori restino alimentati
+//   per giorni durante un blocco firmware.
+//
+// - FIX: Aggiunto controllo tensione minima batteria (3.0V).
+//   Se la batteria e' sotto soglia, il dispositivo non accende
+//   nulla e va in deep sleep 60 min per permettere la ricarica
+//   solare. Elimina il boot loop con batteria scarica.
 //
 // CHANGELOG v6.5.2:
 // - FIX SETUP: rimosso preheat dal setup. Il setup ora fa solo:
@@ -50,7 +65,7 @@
 
 
 // =====================================================================
-// CONFIGURAZIONE - MODIFICA QUI PER DEBUG/PRODUZIONE
+// MODIFICA QUI PER DEBUG/PRODUZIONE
 // =====================================================================
 
 // Abilitare il preriscaldamento sensori?
@@ -91,6 +106,19 @@
 // Delay dopo accensione 3V3_S prima di tentare I2C (ms)
 // I sensori necessitano tempo per stabilizzarsi dopo power-on
 #define SENSOR_POWERUP_DELAY_MS    500
+
+
+// =====================================================================
+// PROTEZIONE BATTERIA - v6.5.3
+// =====================================================================
+// Soglia minima operativa (mV).
+// LiPo 3.7V: cutoff sicuro a 3.0V.
+// Sotto questa tensione il dispositivo non accende nulla
+// e va in deep sleep lungo per permettere la ricarica solare.
+#define BATTERY_MIN_MV             3000
+
+// Sleep lungo quando batteria critica (60 minuti)
+#define LOW_BATTERY_SLEEP_MS       (60UL * 60UL * 1000UL)  // 60 min
 
 
 // --- FORMULE AUTOMATICHE (NON MODIFICARE) ---
@@ -199,6 +227,7 @@ uint8_t estimateSOC(uint16_t mv);
 // WDT functions
 void wdtStart(void);
 void wdtStop(void);
+void wdtKick(void);
 void wdtCallback(void *data);
 
 // I2C Recovery (con retry)
@@ -207,18 +236,27 @@ bool i2cBusRecoveryWithRetry(void);
 
 
 // =====================================================================
-// WATCHDOG TIMER - IMPLEMENTAZIONE
+// WATCHDOG TIMER - IMPLEMENTAZIONE (v6.5.3 FIX)
 // =====================================================================
 
 /**
  * Callback WDT: scatta se la fase attiva supera WDT_TIMEOUT_MS.
- * Esegue un reboot forzato del dispositivo.
+ * v6.5.3: SPEGNE I SENSORI prima del reboot per evitare
+ * che 3V3_S resti HIGH durante il blocco.
  */
 void wdtCallback(void *data) {
   (void)data;
   Serial.println();
   Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
   Serial.println("  [WDT] TIMEOUT! Sistema bloccato!");
+
+  // v6.5.3 SAFETY NET: spegni sensori PRIMA del reboot
+  // Evita che 3V3_S resti HIGH consumando batteria per giorni
+  #if ENABLE_PREHEAT
+    digitalWrite(SENSOR_POWER_PIN, LOW);
+    Serial.println("  [WDT] 3V3_S SPENTO (safety)");
+  #endif
+
   Serial.println("  [WDT] Reboot automatico in corso...");
   Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
   Serial.flush();
@@ -246,6 +284,20 @@ void wdtStop(void) {
     wdt_active = false;
     Serial.println("[WDT] Fermato (sleep sicuro)");
   }
+}
+
+/**
+ * v6.5.3: Kick del WDT - riavvia il timer senza fermarlo.
+ * Da chiamare periodicamente durante operazioni lunghe (preheat)
+ * per evitare che il WDT scatti durante attese legittime,
+ * mantenendo comunque la protezione contro i blocchi.
+ */
+void wdtKick(void) {
+  if (wdt_active) {
+    api.system.timer.stop(WDT_TIMER_ID);
+  }
+  api.system.timer.start(WDT_TIMER_ID, WDT_TIMEOUT_MS, NULL);
+  wdt_active = true;
 }
 
 
@@ -366,12 +418,12 @@ void setup() {
 
   Serial.println();
   Serial.println("=============================================");
-  Serial.println("  MYRUMINET - SENSORE GAS STALLA v6.5.2");
+  Serial.println("  MYRUMINET - SENSORE GAS STALLA v6.5.3");
   Serial.println("  RAK3172-E / RAK19007 Rev.C / RAK13009");
   Serial.println("  BME680 + NH3 + H2S");
   Serial.println("  LoRaWAN OTAA - EU868 - fPort 77");
   Serial.println("  RUI 4.2.4");
-  Serial.println("  SOFTWARE WDT ATTIVO");
+  Serial.println("  SOFTWARE WDT ATTIVO (kick durante preheat)");
   #if ENABLE_PREHEAT
     Serial.println("  MODALITA: PREHEAT ATTIVO (power-off sensori)");
     Serial.print("  PREHEAT: ");
@@ -389,6 +441,9 @@ void setup() {
   Serial.print("  WDT:     ");
   Serial.print(WDT_TIMEOUT_MS / 1000);
   Serial.println(" sec timeout");
+  Serial.print("  BAT MIN: ");
+  Serial.print(BATTERY_MIN_MV);
+  Serial.println(" mV");
   Serial.print("  JOIN RETRY: ");
   Serial.print(JOIN_RETRY_MINUTES);
   Serial.println(" min");
@@ -432,7 +487,7 @@ void setup() {
   // Join riuscito - il loop fara' il primo ciclo completo
   Serial.println();
   Serial.println("=============================================");
-  Serial.println("  SETUP COMPLETATO - v6.5.2");
+  Serial.println("  SETUP COMPLETATO - v6.5.3");
   Serial.println("  Join OK. Primo ciclo sensori nel loop.");
   Serial.println("=============================================");
   Serial.println();
@@ -445,6 +500,30 @@ void setup() {
 
 void loop() {
 
+  // ===== v6.5.3: CHECK BATTERIA PRIMA DI TUTTO =====
+  // Se la batteria e' sotto la soglia minima (3.0V per LiPo),
+  // non accendere nulla e vai in deep sleep lungo.
+  // Permette al pannello solare di ricaricare senza consumare.
+  uint16_t bat_check = readBatteryMV();
+  if (bat_check < BATTERY_MIN_MV) {
+    Serial.print("[BAT] !!! Tensione critica: ");
+    Serial.print(bat_check);
+    Serial.print(" mV (soglia: ");
+    Serial.print(BATTERY_MIN_MV);
+    Serial.println(" mV)");
+    Serial.println("[BAT] Sensori OFF, sleep lungo 60 min per ricarica solare...");
+    Serial.flush();
+    delay(10);
+
+    // Assicurati che i sensori siano spenti
+    #if ENABLE_PREHEAT
+      digitalWrite(SENSOR_POWER_PIN, LOW);
+    #endif
+
+    api.system.sleep.all(LOW_BATTERY_SLEEP_MS);
+    return;
+  }
+
   // ===== AVVIO WDT - INIZIO FASE ATTIVA =====
   wdtStart();
 
@@ -453,7 +532,7 @@ void loop() {
     Serial.println("[LORA] Sessione LoRaWAN non presente.");
     joined = false;
 
-    // Ferma WDT durante il join (può durare fino a 150s)
+    // Ferma WDT durante il join (puo' durare fino a 150s)
     wdtStop();
     joinNetwork();
 
@@ -487,14 +566,15 @@ void loop() {
     Serial.print(PREHEAT_MINUTES);
     Serial.println(" min)...");
 
-    // Ferma WDT durante preheat (dura minuti)
-    wdtStop();
+    // v6.5.3: WDT resta ATTIVO durante il preheat.
+    // preheatWait() chiama wdtKick() ad ogni blocco di 30 sec.
+    // Se un delay(30000) si blocca, il WDT resetta dopo 120 sec.
     preheatWait();
     Serial.println("[PWR] Preriscaldo completato");
     Serial.println();
 
-    // Riavvia WDT per fase lettura
-    wdtStart();
+    // Kick WDT dopo preheat per dare 120 sec freschi alla fase lettura
+    wdtKick();
   #endif
 
   // ----- I2C BUS RECOVERY CON RETRY + INIT SENSORI -----
@@ -631,9 +711,23 @@ void loop() {
 
 #if ENABLE_PREHEAT
 
+/**
+ * v6.5.3: preheatWait con WDT kick ad ogni blocco.
+ * Il WDT resta attivo durante tutto il preheat.
+ * Se un singolo delay(30000) si blocca, il WDT
+ * resetta il dispositivo dopo 120 sec.
+ */
 void preheatWait(void) {
   for (unsigned int i = 1; i <= PREHEAT_BLOCKS; i++) {
+
+    // v6.5.3: Kick del WDT prima di ogni blocco di 30 sec.
+    // Questo riavvia il countdown di 120 sec.
+    // Se delay(30000) si blocca, il WDT scatta dopo 120 sec
+    // e il callback spegne i sensori prima del reboot.
+    wdtKick();
+
     delay(PREHEAT_BLOCK);
+
     Serial.print("[PWR] Preheat: ");
     Serial.print(i * 30);
     Serial.print(" sec / ");
