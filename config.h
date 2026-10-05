@@ -16,10 +16,15 @@
 // =====================================================================
 // VERSIONE FIRMWARE
 // =====================================================================
-#define FW_VERSION        "6.7.0"
+#define FW_VERSION        "6.7.1"
 #define FW_NAME           "MYRUMINET - SENSORE GAS STALLA"
 #define FW_BOARD          "RAK3172-E / RAK19007 Rev.C"
 #define FW_MODULES        "BME680 + NH3 + H2S + RTC + FLASH"
+#define RECOVERY_MODE     false
+#define I2C_TIMEOUT_MS    3000
+#define IWDG_TIMEOUT_MS   60000
+#define REBOOT_EVERY_N_CYCLES     336     // 336 * 30 min = 7 giorni
+#define SWWDT_TIMEOUT_MS  30000   // 30 secondi timeout SW watchdog
 
 
 // =====================================================================

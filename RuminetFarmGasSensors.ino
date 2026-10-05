@@ -1,6 +1,6 @@
 
 // =====================================================================
-// GAS_Sensor_v6.7.ino - FIRMWARE FSM PULITA
+// GAS_Sensor_v6.7.1.ino - FIRMWARE FSM PULITA + I2C RECOVERY
 // =====================================================================
 // MYRUMINET - Sensore Gas Stalla
 // RAK3172-E / RAK19007 Rev.C
@@ -18,9 +18,18 @@
 //   - ZERO ATZ automatico
 //   - ZERO callback da interrupt
 //   - Ogni stato si completa prima del successivo
-//   - Se il join fallisce: sleep 2 min + retry (max 5), poi sleep lungo
-//   - Se il firmware si blocca: solo pyocd puo' recuperare
-//     (ma non si blocchera' perche' non ci sono timer/ATZ)
+//
+// NOVITA' v6.7.1 rispetto a v6.7.0:
+//   - I2C clock recovery (9 impulsi SCL) al boot e al wakeup
+//   - I2C scan diagnostico al boot
+//   - Timeout diagnostico su init RTC e Flash
+//   - Power cycle 3V3_S preventivo al wakeup
+//   - Software watchdog per fasi I2C critiche
+//     (IWDG hardware rimosso: incompatibile con sleep)
+//   - Recovery mode (#define RECOVERY_MODE)
+//   - Log PRE_SLEEP per catturare crash post-sleep
+//   - Reboot periodico preventivo ogni N cicli
+//   - Flash log: scrittura sicura con diagnostica
 //
 // Comandi AT custom (prefisso ATC+):
 //   ATC+INFO_GAS       -> diagnostica + dump flash + pausa
@@ -45,10 +54,38 @@
 
 
 // =====================================================================
-// FSM — DEFINIZIONE STATI
+// CONFIGURAZIONE v6.7.1
 // =====================================================================
 
-typedef enum {
+#ifndef RECOVERY_MODE
+#define RECOVERY_MODE           false
+#endif
+
+#ifndef I2C_TIMEOUT_MS
+#define I2C_TIMEOUT_MS          3000
+#endif
+
+#ifndef REBOOT_EVERY_N_CYCLES
+#define REBOOT_EVERY_N_CYCLES   336
+#endif
+
+#ifndef SWWDT_TIMEOUT_MS
+#define SWWDT_TIMEOUT_MS        30000
+#endif
+
+#ifndef I2C_SDA_PIN
+#define I2C_SDA_PIN             PA11
+#endif
+#ifndef I2C_SCL_PIN
+#define I2C_SCL_PIN             PA12
+#endif
+
+
+// =====================================================================
+// FSM -- DEFINIZIONE STATI
+// =====================================================================
+
+enum FsmState : uint8_t {
     STATE_BOOT = 0,
     STATE_JOIN,
     STATE_JOIN_RETRY,
@@ -64,7 +101,7 @@ typedef enum {
     STATE_JOIN_CHECK,
     STATE_ERROR,
     STATE_COUNT
-} FsmState;
+};
 
 static const char* stateNames[] = {
     "BOOT", "JOIN", "JOIN_RETRY", "PREHEAT",
@@ -75,7 +112,7 @@ static const char* stateNames[] = {
 
 
 // =====================================================================
-// FSM — VARIABILI
+// FSM -- VARIABILI GLOBALI
 // =====================================================================
 
 static FsmState currentState  = STATE_BOOT;
@@ -85,14 +122,14 @@ static uint8_t  joinRetryCount = 0;
 
 #define MAX_JOIN_RETRIES     5
 #define MAX_ERROR_COUNT      3
-#define ERROR_SLEEP_MS       60000UL    // 1 minuto
-#define JOIN_RETRY_SLEEP_MS  120000UL   // 2 minuti
-#define LONG_SLEEP_MS        120000UL   // 2 minuti (dopo max retry)
-#define JOIN_TIMEOUT_MS      90000UL    // 90 secondi
+#define ERROR_SLEEP_MS       60000UL
+#define JOIN_RETRY_SLEEP_MS  120000UL
+#define LONG_SLEEP_MS        120000UL
+#define JOIN_TIMEOUT_MS      90000UL
 
 
 // =====================================================================
-// DATI CICLO — Condivisi tra stati
+// DATI CICLO -- Condivisi tra stati
 // =====================================================================
 
 static BmeData  bmeData     = {0.0f, 0.0f, 0.0f, 0};
@@ -103,10 +140,54 @@ static bool     tx_ok       = false;
 static bool     sensors_ok  = false;
 static char     jsonLogBuf[FLASH_RECORD_SIZE];
 static const char *cycleTimestamp = "";
+static uint32_t flashWriteCount = 0;
 
 
 // =====================================================================
-// FSM — TRANSIZIONE
+// SOFTWARE WATCHDOG -- Timeout per fasi I2C critiche
+// =====================================================================
+// NON usa IWDG hardware (incompatibile con sleep: l'IWDG non si
+// ferma durante sleepSimple e resetta il MCU dopo ~28s).
+// Controlla il tempo trascorso nelle fasi critiche.
+// Se supera il timeout, forza reboot via api.system.reboot().
+// =====================================================================
+
+static uint32_t swWdtStartMs   = 0;
+static uint32_t swWdtTimeoutMs = 0;
+static bool     swWdtActive    = false;
+
+void swWatchdogStart(uint32_t timeout_ms)
+{
+    swWdtStartMs   = millis();
+    swWdtTimeoutMs = timeout_ms;
+    swWdtActive    = true;
+}
+
+void swWatchdogStop(void)
+{
+    swWdtActive = false;
+}
+
+void swWatchdogCheck(void)
+{
+    if (!swWdtActive) return;
+
+    uint32_t elapsed = millis() - swWdtStartMs;
+    if (elapsed >= swWdtTimeoutMs) {
+        Serial.println();
+        Serial.println("[SWWDT] !!! TIMEOUT SCADUTO !!!");
+        Serial.print("[SWWDT] Fase durata ");
+        Serial.print(elapsed / 1000);
+        Serial.println("s -- REBOOT FORZATO");
+        Serial.flush();
+        delay(100);
+        api.system.reboot();
+    }
+}
+
+
+// =====================================================================
+// FSM -- TRANSIZIONE
 // =====================================================================
 
 void fsmTransition(FsmState newState)
@@ -134,6 +215,164 @@ void fsmTransitionError(const char* reason)
 
 
 // =====================================================================
+// I2C CLOCK RECOVERY -- Sblocca device in hang
+// =====================================================================
+
+void i2cClockRecovery(void)
+{
+    Serial.print("[I2C] Clock recovery (9 impulsi SCL)... ");
+
+    Wire.end();
+    delay(10);
+
+    pinMode(I2C_SCL_PIN, OUTPUT);
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+
+    if (digitalRead(I2C_SDA_PIN) == HIGH) {
+        Serial.println("SDA gia' HIGH, bus OK");
+        return;
+    }
+
+    Serial.print("SDA basso, recovery... ");
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(I2C_SCL_PIN, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(I2C_SCL_PIN, LOW);
+        delayMicroseconds(5);
+
+        if (digitalRead(I2C_SDA_PIN) == HIGH) {
+            Serial.print("OK dopo ");
+            Serial.print(i + 1);
+            Serial.println(" impulsi");
+            break;
+        }
+    }
+
+    pinMode(I2C_SDA_PIN, OUTPUT);
+    digitalWrite(I2C_SDA_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SDA_PIN, HIGH);
+    delayMicroseconds(5);
+
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    delay(1);
+    if (digitalRead(I2C_SDA_PIN) == HIGH) {
+        Serial.println("[I2C] Recovery OK -- SDA rilasciato");
+    } else {
+        Serial.println("[I2C] Recovery FALLITA -- SDA ancora basso!");
+    }
+}
+
+
+// =====================================================================
+// I2C SCAN DIAGNOSTICO
+// =====================================================================
+
+uint8_t i2cScan(void)
+{
+    uint8_t found = 0;
+    Serial.println("[I2C] Scanning bus...");
+
+    for (uint8_t addr = 0x01; addr < 0x7F; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission();
+        if (err == 0) {
+            found++;
+            Serial.print("[I2C]   0x");
+            if (addr < 16) Serial.print("0");
+            Serial.print(addr, HEX);
+            Serial.print(" -> ");
+            if      (addr == RTC_I2C_ADDR)    Serial.println("RV-3028 RTC");
+            else if (addr == BME680_I2C_ADDR) Serial.println("BME680");
+            else if (addr == NH3_I2C_ADDR)    Serial.println("DFRobot NH3");
+            else if (addr == H2S_I2C_ADDR)    Serial.println("DFRobot H2S");
+            else                               Serial.println("SCONOSCIUTO");
+        }
+    }
+
+    Serial.print("[I2C] Trovati: ");
+    Serial.print(found);
+    Serial.println(" device");
+    return found;
+}
+
+
+// =====================================================================
+// I2C INIT SICURO -- con clock recovery + scan
+// =====================================================================
+
+bool i2cInitSafe(void)
+{
+    i2cClockRecovery();
+
+    uint32_t startMs = millis();
+    Wire.begin();
+    uint32_t elapsed = millis() - startMs;
+
+    Serial.print("[I2C] Wire.begin() completato in ");
+    Serial.print(elapsed);
+    Serial.println(" ms");
+
+    if (elapsed > 1000) {
+        Serial.println("[I2C] WARNING: Wire.begin() lento!");
+    }
+
+    delay(100);
+    Serial.println("[I2C] Bus OK");
+
+    uint8_t devCount = i2cScan();
+    Serial.println();
+
+    return (devCount > 0);
+}
+
+
+// =====================================================================
+// INIT CON TIMEOUT DIAGNOSTICO
+// =====================================================================
+
+bool rtcInitWithTimeout(void)
+{
+    Serial.print("[RTC] Init... ");
+    uint32_t startMs = millis();
+
+    rtcInit();
+
+    uint32_t elapsed = millis() - startMs;
+    Serial.print("completato in ");
+    Serial.print(elapsed);
+    Serial.println(" ms");
+
+    if (elapsed > I2C_TIMEOUT_MS) {
+        Serial.println("[RTC] WARNING: init lento, possibile problema I2C");
+        return false;
+    }
+    return true;
+}
+
+bool flashLogInitWithTimeout(void)
+{
+    Serial.print("[FLASH] Init GD25Q16C... ");
+    uint32_t startMs = millis();
+
+    flashLogInit();
+
+    uint32_t elapsed = millis() - startMs;
+    Serial.print("completato in ");
+    Serial.print(elapsed);
+    Serial.println(" ms");
+
+    if (elapsed > I2C_TIMEOUT_MS) {
+        Serial.println("[FLASH] WARNING: init lento");
+        return false;
+    }
+    return true;
+}
+
+
+// =====================================================================
 // POWER CONTROL SENSORI
 // =====================================================================
 
@@ -151,6 +390,35 @@ void sensorPowerOff(void)
     gasReset();
     digitalWrite(SENSOR_POWER_PIN, LOW);
     Serial.println("[PWR] 3V3_S OFF");
+}
+
+void sensorPowerCycle(void)
+{
+    Serial.println("[PWR] Power cycle 3V3_S...");
+    digitalWrite(SENSOR_POWER_PIN, LOW);
+    delay(500);
+    digitalWrite(SENSOR_POWER_PIN, HIGH);
+    delay(SENSOR_POWERUP_DELAY_MS);
+    Serial.println("[PWR] Power cycle completato");
+}
+
+
+// =====================================================================
+// FLASH LOG -- SCRITTURA SICURA CON DIAGNOSTICA
+// =====================================================================
+
+void flashLogWriteSafe(const char *record)
+{
+    flashLogWake();
+    flashLogWrite(record);
+    flashWriteCount++;
+
+    if (flashWriteCount % 1000 == 0) {
+        Serial.print("[FLASH] Scritture da boot: ");
+        Serial.println(flashWriteCount);
+    }
+
+    flashLogSleep();
 }
 
 
@@ -188,11 +456,10 @@ int infoGasHandler(SERIAL_PORT port, char *cmd, stParam *param)
 
     Serial.println();
     Serial.println("=============================================");
-    Serial.println("  ATC+INFO_GAS - DIAGNOSTICA v6.7 FSM");
+    Serial.println("  ATC+INFO_GAS - DIAGNOSTICA v6.7.1 FSM");
     Serial.println("=============================================");
     Serial.println();
 
-    // Stato FSM
     Serial.print("{\"fsm\":{\"state\":\""); Serial.print(stateNames[currentState]);
     Serial.print("\",\"prev\":\""); Serial.print(stateNames[previousState]);
     Serial.print("\",\"errors\":"); Serial.print(errorCount);
@@ -200,7 +467,6 @@ int infoGasHandler(SERIAL_PORT port, char *cmd, stParam *param)
     Serial.println("}}");
     Serial.println();
 
-    // Firmware
     Serial.println("{\"firmware\":{");
     Serial.print("  \"version\":\""); Serial.print(FW_VERSION); Serial.println("\",");
     Serial.print("  \"board\":\""); Serial.print(FW_BOARD); Serial.println("\",");
@@ -208,25 +474,23 @@ int infoGasHandler(SERIAL_PORT port, char *cmd, stParam *param)
     Serial.print("  \"cycle_count\":"); Serial.print(diag.cycleCount); Serial.println(",");
     Serial.print("  \"successful_tx\":"); Serial.print(diag.successfulTx); Serial.println(",");
     Serial.print("  \"tx_fail_count\":"); Serial.print(diag.lastTxFailCount); Serial.println(",");
-    Serial.print("  \"wdt_triggered\":"); Serial.println(diag.wdtTriggered);
+    Serial.print("  \"wdt_triggered\":"); Serial.print(diag.wdtTriggered); Serial.println(",");
+    Serial.print("  \"flash_writes\":"); Serial.print(flashWriteCount); Serial.println(",");
+    Serial.print("  \"reboot_every\":"); Serial.println(REBOOT_EVERY_N_CYCLES);
     Serial.println("}}");
     Serial.println();
 
-    // RTC
     Serial.print("{\"rtc\":\""); Serial.print(rtcGetTimestamp()); Serial.println("\"}");
     Serial.println();
 
-    // Batteria
     uint16_t bat = readBatteryMV();
     Serial.print("{\"battery\":{\"mv\":"); Serial.print(bat);
     Serial.print(",\"soc\":"); Serial.print(estimateSOC(bat));
     Serial.println("}}");
     Serial.println();
 
-    // Memoria
     memPrintInfo("ATC+INFO_GAS");
 
-    // Sensori live
     Serial.println("{\"sensors\":{");
     if (digitalRead(SENSOR_POWER_PIN) == HIGH) {
         BmeData bme = bmeRead();
@@ -244,19 +508,20 @@ int infoGasHandler(SERIAL_PORT port, char *cmd, stParam *param)
     Serial.println("}}");
     Serial.println();
 
-    // LoRaWAN
     Serial.print("{\"lorawan\":{\"joined\":"); Serial.print(api.lorawan.njs.get() ? "true" : "false");
     Serial.print(",\"dr\":"); Serial.print(api.lorawan.dr.get());
     Serial.print(",\"adr\":"); Serial.print(api.lorawan.adr.get() ? "true" : "false");
     Serial.println("}}");
     Serial.println();
 
-    // Flash log dump
+    Serial.print("{\"flash\":{\"writes_this_boot\":"); Serial.print(flashWriteCount);
+    Serial.println("}}");
+    Serial.println();
+
     flashLogWake();
     flashLogDump();
     flashLogSleep();
 
-    // Pausa
     flash_paused = true;
     Serial.println();
     Serial.println("  *** CICLO IN PAUSA ***");
@@ -282,6 +547,7 @@ int clearlogGasHandler(SERIAL_PORT port, char *cmd, stParam *param)
     flashLogWake();
     flashLogClear();
     flashLogSleep();
+    flashWriteCount = 0;
     Serial.println("[AT] Log cancellato!");
     return AT_OK;
 }
@@ -328,26 +594,25 @@ void registerATCommands(void)
 
 
 // =====================================================================
-// FSM — HANDLER PER OGNI STATO
+// STATE_BOOT
 // =====================================================================
 
-// -----------------------------------------------------------------
-// STATE_BOOT
-// -----------------------------------------------------------------
 void stateBoot(void)
 {
     Serial.begin(115200);
     api.system.lpm.set(1);
     delay(2000);
 
-    // Reset reason
     hwWatchdogCheckResetReason();
 
-    // Banner
     Serial.println();
     Serial.println("=============================================");
     Serial.println("  " FW_NAME);
-    Serial.println("  FIRMWARE v" FW_VERSION " -- FSM PULITA");
+#if RECOVERY_MODE
+    Serial.println("  *** RECOVERY MODE v6.7.1 ***");
+#else
+    Serial.println("  FIRMWARE v6.7.1 -- FSM PULITA + I2C FIX");
+#endif
     Serial.println("  " FW_BOARD);
     Serial.println("  " FW_MODULES);
     Serial.println("  LoRaWAN OTAA - EU868 - fPort 77");
@@ -356,29 +621,28 @@ void stateBoot(void)
     Serial.println(" min preheat");
     Serial.print("  Join timeout: "); Serial.print(JOIN_TIMEOUT_MS / 1000); Serial.println("s");
     Serial.println("  No timer, no ATZ, no callback");
+    Serial.println("  I2C recovery + SW watchdog attivi");
+    Serial.print("  Reboot preventivo ogni "); Serial.print(REBOOT_EVERY_N_CYCLES);
+    Serial.print(" cicli (~"); Serial.print((uint32_t)REBOOT_EVERY_N_CYCLES * CYCLE_TOTAL_MIN / 60 / 24);
+    Serial.println(" giorni)");
     if (hwWatchdogWasReset()) {
         Serial.println("  *** RECOVERY DA RESET ***");
     }
     Serial.println("=============================================");
     Serial.println();
 
-    // Diagnostica boot
     printBootDiagnostic();
     if (hwWatchdogWasReset()) {
         diag.wdtTriggered++;
     }
 
-    // Init (stub, nessun timer)
     hwWatchdogInit(0);
 
-    // Comandi AT
     registerATCommands();
 
-    // Memory baseline
     memSetBaseline();
     memPrintInfo("BOOT");
 
-    // Stabilizzazione alimentazione prima di accendere sensori
     uint16_t bootBat = readBatteryMV();
     Serial.print("[BOOT] Alimentazione: "); Serial.print(bootBat); Serial.println(" mV");
     if (bootBat < 3300 || bootBat > 4500) {
@@ -386,57 +650,84 @@ void stateBoot(void)
         delay(3000);
     }
 
-    // Power on sensori (per RTC + Flash init)
+    Serial.println("[SWWDT] Software watchdog attivo");
+    swWatchdogStart(SWWDT_TIMEOUT_MS);
+
     sensorPowerOn();
 
-    // I2C
-    Wire.begin();
-    delay(100);
-    Serial.println("[I2C] Bus OK");
+    bool i2c_ok = i2cInitSafe();
+    swWatchdogCheck();
+
+    if (!i2c_ok) {
+        Serial.println("[BOOT] Nessun device I2C trovato -- power cycle e retry");
+        sensorPowerCycle();
+        i2c_ok = i2cInitSafe();
+        swWatchdogCheck();
+    }
+
+    swWatchdogStop();
+
+#if RECOVERY_MODE
+    Serial.println("[RECOVERY] Modalita' recovery attiva");
+    Serial.println("[RECOVERY] Salto init RTC e sensori");
     Serial.println();
 
-    // RTC
-    rtcInit();
+    Serial.println("[RECOVERY] Init flash SPI...");
+    flashLogInitWithTimeout();
+    Serial.println();
+
+    Serial.println("[RECOVERY] === DUMP FLASH LOG ===");
+    flashLogWake();
+    flashLogDump();
+    flashLogSleep();
+    Serial.println("[RECOVERY] === FINE DUMP ===");
+    Serial.println();
+
+    flash_paused = true;
+    Serial.println("[RECOVERY] In attesa comandi AT...");
+    Serial.println("  ATC+INFO_GAS     -> diagnostica");
+    Serial.println("  ATC+CLEARLOG_GAS -> cancella log");
+    Serial.println("  ATC+RESUME_GAS   -> avvia ciclo normale");
+    Serial.println();
+    return;
+#endif
+
+    rtcInitWithTimeout();
     rtcAutoSetFromCompileTime();
     rtcPrintTime();
     Serial.println();
 
-    // Flash log
-    flashLogInit();
+    flashLogInitWithTimeout();
 
     if (hwWatchdogWasReset()) {
         snprintf(jsonLogBuf, sizeof(jsonLogBuf),
             "{\"c\":%lu,\"ts\":\"%s\",\"st\":\"RESET_RECOVERY\",\"mem\":{\"free\":%lu}}",
             diag.cycleCount, rtcGetTimestamp(), (unsigned long)memGetFreeHeap());
-        flashLogWrite(jsonLogBuf);
+        flashLogWriteSafe(jsonLogBuf);
         Serial.println("[FLASH] Loggato RESET_RECOVERY");
     }
 
-    flashLogSleep();
     Serial.println();
 
-    // Spegni sensori (risparmio durante join)
     sensorPowerOff();
 
-    // Memory post-init
     memPrintInfo("POST-INIT");
 
-    // LoRaWAN config
     loraPrintDeviceInfo();
     loraInit();
 
-    // Reset contatori
-    errorCount     = 0;
-    joinRetryCount = 0;
+    errorCount      = 0;
+    joinRetryCount  = 0;
+    flashWriteCount = 0;
 
-    // -> JOIN
     fsmTransition(STATE_JOIN);
 }
 
 
-// -----------------------------------------------------------------
-// STATE_JOIN — Join BLOCCANTE, nessun timer parallelo
-// -----------------------------------------------------------------
+// =====================================================================
+// STATE_JOIN
+// =====================================================================
+
 void stateJoin(void)
 {
     Serial.println("[JOIN] Avvio join OTAA (bloccante, no timer)...");
@@ -447,7 +738,6 @@ void stateJoin(void)
         return;
     }
 
-    // Polling bloccante
     uint32_t startMs = millis();
     uint32_t elapsed = 0;
 
@@ -474,16 +764,16 @@ void stateJoin(void)
         Serial.println("s");
     }
 
-    // Timeout
     Serial.println("[JOIN] TIMEOUT 90s -- join fallito");
     joined = false;
     fsmTransition(STATE_JOIN_RETRY);
 }
 
 
-// -----------------------------------------------------------------
-// STATE_JOIN_RETRY — Sleep 2 min + retry, max 5 tentativi
-// -----------------------------------------------------------------
+// =====================================================================
+// STATE_JOIN_RETRY
+// =====================================================================
+
 void stateJoinRetry(void)
 {
     joinRetryCount++;
@@ -498,16 +788,13 @@ void stateJoinRetry(void)
         Serial.print("[JOIN-RETRY] Sleep lungo "); Serial.print(LONG_SLEEP_MS / 1000);
         Serial.println("s poi riprovo da zero");
 
-        // Reset contatore e sleep lungo
         joinRetryCount = 0;
         sleepSimple(LONG_SLEEP_MS);
 
-        // Riprova da JOIN
         fsmTransition(STATE_JOIN);
         return;
     }
 
-    // Sleep tra retry
     Serial.print("[JOIN-RETRY] Sleep "); Serial.print(JOIN_RETRY_SLEEP_MS / 1000);
     Serial.println("s prima del prossimo tentativo");
 
@@ -517,9 +804,10 @@ void stateJoinRetry(void)
 }
 
 
-// -----------------------------------------------------------------
-// STATE_PREHEAT — Riscaldamento sensori (SOLO dopo join OK)
-// -----------------------------------------------------------------
+// =====================================================================
+// STATE_PREHEAT
+// =====================================================================
+
 void statePreheat(void)
 {
     diag.cycleCount++;
@@ -529,10 +817,9 @@ void statePreheat(void)
     Serial.println("=============================================");
     Serial.println();
 
-    // Accendi sensori
     sensorPowerOn();
 
-    #if ENABLE_PREHEAT
+#if ENABLE_PREHEAT
     uint32_t totalSec = (uint32_t)PREHEAT_MINUTES * 60UL;
     uint32_t elapsed  = 0;
     uint32_t blockSec = 5;
@@ -540,7 +827,6 @@ void statePreheat(void)
     Serial.println("[PREHEAT] Preriscaldo sensori...");
 
     while (elapsed < totalSec) {
-        // Pausa AT
         while (flash_paused) {
             delay(100);
         }
@@ -557,30 +843,41 @@ void statePreheat(void)
 
     Serial.println("[PREHEAT] Completato");
     Serial.println();
-    #endif
+#endif
 
     fsmTransition(STATE_I2C_RECOVERY);
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_I2C_RECOVERY
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateI2cRecovery(void)
 {
+    swWatchdogStart(SWWDT_TIMEOUT_MS);
+
+    i2cClockRecovery();
+
     Wire.begin();
     delay(100);
+    swWatchdogCheck();
+
     i2c_bus_ok = i2cBusRecoveryWithRetry();
+    swWatchdogCheck();
 
     if (!i2c_bus_ok) {
         Serial.println("[I2C] Bus fail! Power cycle...");
-        sensorPowerOff();
-        delay(2000);
-        sensorPowerOn();
+        sensorPowerCycle();
+
+        i2cClockRecovery();
         Wire.begin();
         delay(500);
         i2c_bus_ok = i2cBusRecoveryWithRetry();
+        swWatchdogCheck();
     }
+
+    swWatchdogStop();
 
     if (i2c_bus_ok) {
         sensors_ok = true;
@@ -595,33 +892,44 @@ void stateI2cRecovery(void)
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_READ_SENSORS
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateReadSensors(void)
 {
+    swWatchdogStart(SWWDT_TIMEOUT_MS);
+
     bmeInit();
+    swWatchdogCheck();
+
     gasInitAll();
+    swWatchdogCheck();
 
     Serial.println("--- LETTURA SENSORI ---");
 
     bmeData = bmeRead();
+    swWatchdogCheck();
     Serial.print("[BME680] Temp: "); Serial.print(bmeData.temperature, 2); Serial.println(" C");
     Serial.print("[BME680] Hum:  "); Serial.print(bmeData.humidity, 2); Serial.println(" %");
     Serial.print("[BME680] Pres: "); Serial.print(bmeData.pressure, 2); Serial.println(" hPa");
     Serial.print("[BME680] VOC:  "); Serial.print(bmeData.voc_resistance); Serial.println(" Ohm");
 
     gasData = gasRead();
+    swWatchdogCheck();
     Serial.print("[NH3] Conc: "); Serial.print(gasData.nh3_ppm, 2); Serial.println(" ppm");
     Serial.print("[H2S] Conc: "); Serial.print(gasData.h2s_ppm, 2); Serial.println(" ppm");
+
+    swWatchdogStop();
 
     fsmTransition(STATE_BATTERY_CHECK);
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_BATTERY_CHECK
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateBatteryCheck(void)
 {
     battery_mv  = readBatteryMV();
@@ -635,12 +943,10 @@ void stateBatteryCheck(void)
     if (battery_mv < BATTERY_MIN_MV && battery_mv > 0) {
         Serial.println("[BAT] TENSIONE CRITICA -- sleep lungo");
 
-        flashLogWake();
         snprintf(jsonLogBuf, sizeof(jsonLogBuf),
             "{\"c\":%lu,\"ts\":\"%s\",\"st\":\"LOW_BAT\",\"bat\":{\"mv\":%u}}",
             diag.cycleCount, rtcGetTimestamp(), battery_mv);
-        flashLogWrite(jsonLogBuf);
-        flashLogSleep();
+        flashLogWriteSafe(jsonLogBuf);
 
         sensorPowerOff();
         sleepSimple(LOW_BATTERY_SLEEP_MS);
@@ -658,22 +964,20 @@ void stateBatteryCheck(void)
 
     if (memCheckCritical()) {
         Serial.println("[MEM] CRITICA -- loggo e proseguo comunque");
-        flashLogWake();
         snprintf(jsonLogBuf, sizeof(jsonLogBuf),
             "{\"c\":%lu,\"ts\":\"%s\",\"st\":\"MEM_CRITICAL\",\"mem\":{\"free\":%lu}}",
             diag.cycleCount, cycleTimestamp, (unsigned long)memGetFreeHeap());
-        flashLogWrite(jsonLogBuf);
-        flashLogSleep();
-        // NON resetto, proseguo -- il ciclo e' piu' importante
+        flashLogWriteSafe(jsonLogBuf);
     }
 
     fsmTransition(STATE_BUILD_PAYLOAD);
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_BUILD_PAYLOAD
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateBuildPayload(void)
 {
     loraBuildPayload(
@@ -687,9 +991,10 @@ void stateBuildPayload(void)
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_TX
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateTx(void)
 {
     Serial.print("[LORA] TX 19 bytes fPort "); Serial.println(LORAWAN_FPORT);
@@ -720,7 +1025,6 @@ void stateTx(void)
         }
     }
 
-    // Radio wait (RX1 + RX2)
     delay(3000);
     delay(3000);
 
@@ -728,22 +1032,20 @@ void stateTx(void)
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_LOG_FLASH
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateLogFlash(void)
 {
-    flashLogWake();
-
     const char *phase;
     if (!sensors_ok)    phase = "I2C_FAIL";
     else if (tx_ok)     phase = "TX_OK";
     else                phase = "TX_FAIL";
 
     buildJsonLog(cycleTimestamp, phase);
-    flashLogWrite(jsonLogBuf);
+    flashLogWriteSafe(jsonLogBuf);
     Serial.print("[FLASH] "); Serial.println(jsonLogBuf);
-    flashLogSleep();
 
     memUpdateMin();
     Serial.print("[MEM] Free: "); Serial.print(memGetFreeHeap());
@@ -754,11 +1056,46 @@ void stateLogFlash(void)
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_SLEEP
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateSleep(void)
 {
+    snprintf(jsonLogBuf, sizeof(jsonLogBuf),
+        "{\"c\":%lu,\"ts\":\"%s\",\"st\":\"PRE_SLEEP\",\"bat\":{\"mv\":%u},\"mem\":{\"free\":%lu}}",
+        diag.cycleCount, cycleTimestamp, battery_mv,
+        (unsigned long)memGetFreeHeapForLog());
+    flashLogWriteSafe(jsonLogBuf);
+
+    if (diag.cycleCount > 0 && (diag.cycleCount % REBOOT_EVERY_N_CYCLES) == 0) {
+        snprintf(jsonLogBuf, sizeof(jsonLogBuf),
+            "{\"c\":%lu,\"ts\":\"%s\",\"st\":\"SCHEDULED_REBOOT\","
+            "\"bat\":{\"mv\":%u,\"soc\":%u},"
+            "\"mem\":{\"free\":%lu,\"min\":%lu},"
+            "\"flash_writes\":%lu}",
+            diag.cycleCount, cycleTimestamp,
+            battery_mv, battery_soc,
+            (unsigned long)memGetFreeHeapForLog(),
+            (unsigned long)memGetMinHeapForLog(),
+            (unsigned long)flashWriteCount);
+        flashLogWriteSafe(jsonLogBuf);
+
+        Serial.println();
+        Serial.println("=============================================");
+        Serial.print("  REBOOT PREVENTIVO -- ciclo #");
+        Serial.println(diag.cycleCount);
+        Serial.print("  Prossimo reboot al ciclo #");
+        Serial.println(diag.cycleCount + REBOOT_EVERY_N_CYCLES);
+        Serial.println("=============================================");
+        Serial.flush();
+
+        sensorPowerOff();
+        delay(2000);
+
+        api.system.reboot();
+    }
+
     sensorPowerOff();
 
     Serial.println();
@@ -774,9 +1111,10 @@ void stateSleep(void)
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_WAKEUP
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateWakeup(void)
 {
     Serial.println();
@@ -784,13 +1122,19 @@ void stateWakeup(void)
     Serial.println(diag.cycleCount);
     Serial.println();
 
+    Serial.println("[WAKE] Power cycle preventivo sensori...");
+    sensorPowerCycle();
+
+    i2cClockRecovery();
+
     fsmTransition(STATE_JOIN_CHECK);
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_JOIN_CHECK
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateJoinCheck(void)
 {
     if (api.lorawan.njs.get()) {
@@ -806,9 +1150,10 @@ void stateJoinCheck(void)
 }
 
 
-// -----------------------------------------------------------------
+// =====================================================================
 // STATE_ERROR
-// -----------------------------------------------------------------
+// =====================================================================
+
 void stateError(void)
 {
     Serial.println();
@@ -818,13 +1163,10 @@ void stateError(void)
     Serial.println("=============================================");
     Serial.println();
 
-    // Log su flash
-    flashLogWake();
     snprintf(jsonLogBuf, sizeof(jsonLogBuf),
         "{\"c\":%lu,\"ts\":\"%s\",\"st\":\"ERROR\",\"prev\":\"%s\",\"err\":%u}",
         diag.cycleCount, rtcGetTimestamp(), stateNames[previousState], errorCount);
-    flashLogWrite(jsonLogBuf);
-    flashLogSleep();
+    flashLogWriteSafe(jsonLogBuf);
 
     sensorPowerOff();
 
@@ -836,7 +1178,6 @@ void stateError(void)
         return;
     }
 
-    // Sleep breve e riprova
     Serial.print("[ERROR] Sleep "); Serial.print(ERROR_SLEEP_MS / 1000);
     Serial.println("s poi riprovo");
 
@@ -862,7 +1203,7 @@ void stateError(void)
 
 
 // =====================================================================
-// FSM — ENGINE
+// FSM ENGINE
 // =====================================================================
 
 void fsmRun(void)
