@@ -2,9 +2,13 @@
 // =====================================================================
 // rtc_time.h - DRIVER RV-3028 RTC (RAK12002)
 // =====================================================================
-// MYRUMINET - Sensore Gas Stalla v6.6
+// MYRUMINET - Sensore Gas Stalla v7.2
+// RAK4630 (nRF52840) / RAK19007 Rev.C
 // Chip: Micro Crystal RV-3028-C7
 // Indirizzo I2C: 0x52
+//
+// Questo driver e' hardware-agnostico — usa solo Wire.h
+// Funziona identico su STM32WLE5 e nRF52840.
 // =====================================================================
 
 #ifndef RTC_TIME_H
@@ -215,26 +219,21 @@ const char* rtcGetTimestamp(void)
 // =====================================================================
 // AUTO-SET RTC DA ORA DI COMPILAZIONE (primo boot)
 // =====================================================================
-// Usa __DATE__ e __TIME__ del compilatore per impostare l'RTC.
-// Attivo SOLO se il Power-On Reset flag e' attivo (RTC vergine o
-// ha perso alimentazione). Al prossimo reboot non sovrascrive.
-// Precisione: ~1 minuto (tempo compilazione + upload)
 
 static int parseMonth(const char *monthStr)
 {
-    // __DATE__ formato: "Sep 28 2026"
-    if (monthStr[0] == 'J' && monthStr[1] == 'a') return 1;   // Jan
-    if (monthStr[0] == 'F') return 2;                          // Feb
-    if (monthStr[0] == 'M' && monthStr[2] == 'r') return 3;   // Mar
-    if (monthStr[0] == 'A' && monthStr[1] == 'p') return 4;   // Apr
-    if (monthStr[0] == 'M' && monthStr[2] == 'y') return 5;   // May
-    if (monthStr[0] == 'J' && monthStr[2] == 'n') return 6;   // Jun
-    if (monthStr[0] == 'J' && monthStr[2] == 'l') return 7;   // Jul
-    if (monthStr[0] == 'A' && monthStr[1] == 'u') return 8;   // Aug
-    if (monthStr[0] == 'S') return 9;                          // Sep
-    if (monthStr[0] == 'O') return 10;                         // Oct
-    if (monthStr[0] == 'N') return 11;                         // Nov
-    if (monthStr[0] == 'D') return 12;                         // Dec
+    if (monthStr[0] == 'J' && monthStr[1] == 'a') return 1;
+    if (monthStr[0] == 'F') return 2;
+    if (monthStr[0] == 'M' && monthStr[2] == 'r') return 3;
+    if (monthStr[0] == 'A' && monthStr[1] == 'p') return 4;
+    if (monthStr[0] == 'M' && monthStr[2] == 'y') return 5;
+    if (monthStr[0] == 'J' && monthStr[2] == 'n') return 6;
+    if (monthStr[0] == 'J' && monthStr[2] == 'l') return 7;
+    if (monthStr[0] == 'A' && monthStr[1] == 'u') return 8;
+    if (monthStr[0] == 'S') return 9;
+    if (monthStr[0] == 'O') return 10;
+    if (monthStr[0] == 'N') return 11;
+    if (monthStr[0] == 'D') return 12;
     return 1;
 }
 
@@ -245,24 +244,20 @@ bool rtcAutoSetFromCompileTime(void)
         return false;
     }
 
-    // Controlla il Power-On Reset flag (bit 0 del registro STATUS)
     uint8_t status = rtcReadReg(RV3028_STATUS);
 
     if (!(status & 0x01)) {
-        // POR flag non attivo = RTC ha gia' un'ora valida
         Serial.println("[RTC] Ora gia' impostata, skip auto-set");
         return false;
     }
 
     Serial.println("[RTC] Power-On Reset rilevato -> auto-set da ora compilazione");
 
-    // Parse __DATE__ = "Sep 28 2026"
     const char *dateStr = __DATE__;
     int month = parseMonth(dateStr);
     int day   = atoi(&dateStr[4]);
     int year  = atoi(&dateStr[7]);
 
-    // Parse __TIME__ = "11:12:30"
     const char *timeStr = __TIME__;
     int hour   = (timeStr[0] - '0') * 10 + (timeStr[1] - '0');
     int minute = (timeStr[3] - '0') * 10 + (timeStr[4] - '0');
@@ -276,15 +271,13 @@ bool rtcAutoSetFromCompileTime(void)
     if (minute < 10) Serial.print("0"); Serial.print(minute); Serial.print(":");
     if (second < 10) Serial.print("0"); Serial.println(second);
 
-    // Imposta l'ora
     rtcSetTime(year, month, day, hour, minute, second);
 
-    // Pulisci il POR flag cosi' al prossimo reboot non sovrascrive
+    // Pulisci il POR flag
     rtcWriteReg(RV3028_STATUS, status & ~0x01);
 
     Serial.println("[RTC] Auto-set completato! POR flag pulito.");
-    Serial.println("[RTC] NOTA: precisione ~1 min (tempo compilazione + upload)");
-    Serial.println("[RTC] Per ora esatta usare: AT+SETTIME=YYYY,MM,DD,HH,MM,SS");
+    Serial.println("[RTC] Per ora esatta: ATC+SETTIME_GAS=YYYY,MM,DD,HH,MM,SS");
 
     return true;
 }

@@ -2,10 +2,14 @@
 // =====================================================================
 // flash_log.h - DRIVER GD25Q16C + RING BUFFER + AT+INFO / AT+RESUME
 // =====================================================================
-// MYRUMINET - Sensore Gas Stalla v6.6
+// MYRUMINET - Sensore Gas Stalla v7.2
+// RAK4630 (nRF52840) / RAK19007 Rev.C
 // Chip: GigaDevice GD25Q16C (16 Mbit = 2 MB)
 // Interfaccia: SPI - Slot B RAK19007
-// CS = SS (PA4), WP = WB_IO1, HOLD = WB_IO2
+// CS = SS (BSP), WP = WB_IO1, HOLD = WB_IO2
+//
+// Questo driver e' hardware-agnostico — usa Arduino SPI.
+// Funziona identico su STM32WLE5 e nRF52840.
 // =====================================================================
 
 #ifndef FLASH_LOG_H
@@ -46,7 +50,7 @@ struct FlashLogHeader {
 
 static FlashLogHeader logHeader;
 static bool flash_ok = false;
-static bool flash_paused = false;
+static volatile bool flash_paused = false;
 
 
 // =====================================================================
@@ -398,8 +402,8 @@ void flashLogDump(void)
     Serial.println("  DUMP COMPLETATO");
     Serial.print("  Record letti: ");
     Serial.println(recordsToRead);
-    Serial.println("  Invia AT+RESUME per riprendere il ciclo");
-    Serial.println("  Invia AT+CLEARLOG per cancellare il log");
+    Serial.println("  Invia ATC+RESUME_GAS per riprendere il ciclo");
+    Serial.println("  Invia ATC+CLEARLOG_GAS per cancellare il log");
     Serial.println("=============================================");
 }
 

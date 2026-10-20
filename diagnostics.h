@@ -1,8 +1,10 @@
 
 // =====================================================================
-// diagnostics.h - WDT, FASI FIRMWARE, I2C RECOVERY, BATTERIA
+// diagnostics.h - FASI FIRMWARE, I2C RECOVERY, BATTERIA
 // =====================================================================
-// MYRUMINET - Sensore Gas Stalla v6.6
+// MYRUMINET v7.2 — RAK4630 (nRF52840) / RAK19007 Rev.C
+// Rimosso .noinit (non supportato su nRF52840/RUI3)
+// Rimosso WDT timer-based (usa watchdog_hw.h)
 // =====================================================================
 
 #ifndef DIAGNOSTICS_H
@@ -13,58 +15,30 @@
 
 
 // =====================================================================
-// FASI FIRMWARE (ordine di esecuzione)
+// FASI FIRMWARE
 // =====================================================================
 
 enum FirmwarePhase : uint8_t {
-    PHASE_BOOT            = 0,
-    PHASE_BATTERY_CHECK   = 1,
-    PHASE_JOIN_CHECK      = 2,
-    PHASE_SENSOR_POWER_ON = 3,
-    PHASE_PREHEAT         = 4,
-    PHASE_I2C_RECOVERY    = 5,
-    PHASE_BME680_INIT     = 6,
-    PHASE_NH3_INIT        = 7,
-    PHASE_H2S_INIT        = 8,
-    PHASE_BME680_READ     = 9,
-    PHASE_NH3_READ        = 10,
-    PHASE_H2S_READ        = 11,
-    PHASE_BATTERY_READ    = 12,
-    PHASE_FLASH_LOG       = 13,
-    PHASE_PAYLOAD_BUILD   = 14,
-    PHASE_LORAWAN_SEND    = 15,
-    PHASE_RADIO_WAIT      = 16,
-    PHASE_SLEEP_PREP      = 17,
-    PHASE_SLEEPING        = 18,
-    PHASE_WAKE            = 19
+    PHASE_BOOT = 0, PHASE_BATTERY_CHECK, PHASE_JOIN_CHECK,
+    PHASE_SENSOR_POWER_ON, PHASE_PREHEAT, PHASE_I2C_RECOVERY,
+    PHASE_BME680_INIT, PHASE_NH3_INIT, PHASE_H2S_INIT,
+    PHASE_BME680_READ, PHASE_NH3_READ, PHASE_H2S_READ,
+    PHASE_BATTERY_READ, PHASE_FLASH_LOG, PHASE_PAYLOAD_BUILD,
+    PHASE_LORAWAN_SEND, PHASE_RADIO_WAIT, PHASE_SLEEP_PREP,
+    PHASE_SLEEPING, PHASE_WAKE
 };
 
 static const char* phaseNames[] = {
-    "BOOT",
-    "BATTERY_CHECK",
-    "JOIN_CHECK",
-    "SENSOR_POWER_ON",
-    "PREHEAT",
-    "I2C_RECOVERY",
-    "BME680_INIT",
-    "NH3_INIT",
-    "H2S_INIT",
-    "BME680_READ",
-    "NH3_READ",
-    "H2S_READ",
-    "BATTERY_READ",
-    "FLASH_LOG",
-    "PAYLOAD_BUILD",
-    "LORAWAN_SEND",
-    "RADIO_WAIT",
-    "SLEEP_PREP",
-    "SLEEPING",
-    "WAKE"
+    "BOOT", "BATTERY_CHECK", "JOIN_CHECK", "SENSOR_POWER_ON",
+    "PREHEAT", "I2C_RECOVERY", "BME680_INIT", "NH3_INIT", "H2S_INIT",
+    "BME680_READ", "NH3_READ", "H2S_READ", "BATTERY_READ",
+    "FLASH_LOG", "PAYLOAD_BUILD", "LORAWAN_SEND", "RADIO_WAIT",
+    "SLEEP_PREP", "SLEEPING", "WAKE"
 };
 
 
 // =====================================================================
-// STRUTTURA DIAGNOSTICA (.noinit - sopravvive a software reboot)
+// STRUTTURA DIAGNOSTICA (RAM normale — persa al reboot)
 // =====================================================================
 
 struct DiagnosticState {
@@ -76,9 +50,9 @@ struct DiagnosticState {
     uint16_t lastBatteryMv;
     uint8_t lastTxFailCount;
     uint8_t wdtTriggered;
-} __attribute__((section(".noinit")));
+};
 
-static DiagnosticState diag __attribute__((section(".noinit")));
+static DiagnosticState diag;
 
 
 // =====================================================================
@@ -103,78 +77,10 @@ static DiagnosticState diag __attribute__((section(".noinit")));
 static volatile bool wdt_active = false;
 static bool i2c_bus_ok = false;
 static bool joined = false;
-static uint8_t tx_fail_count = 0;
 
 
 // =====================================================================
-// WATCHDOG TIMER
-// =====================================================================
-
-void wdtCallback(void *data)
-{
-    (void)data;
-    Serial.println();
-    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    Serial.println("  [WDT] TIMEOUT! Sistema bloccato!");
-    Serial.print("  [WDT] FASE: ");
-    Serial.println(phaseNames[diag.lastPhase]);
-    Serial.print("  [WDT] CICLO: ");
-    Serial.println(diag.cycleCount);
-
-    diag.wdtTriggered = 1;
-
-    #if ENABLE_PREHEAT
-        digitalWrite(SENSOR_POWER_PIN, LOW);
-        Serial.println("  [WDT] 3V3_S SPENTO (safety)");
-    #endif
-
-    Serial.println("  [WDT] Reboot automatico in corso...");
-    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    Serial.flush();
-    delay(100);
-    api.system.reboot();
-}
-
-void wdtStart(void)
-{
-    api.system.timer.start(WDT_TIMER_ID, WDT_TIMEOUT_MS, NULL);
-    wdt_active = true;
-    Serial.print("[WDT] Avviato (timeout ");
-    Serial.print(WDT_TIMEOUT_MS / 1000);
-    Serial.println(" sec)");
-}
-
-void wdtStop(void)
-{
-    if (wdt_active) {
-        api.system.timer.stop(WDT_TIMER_ID);
-        wdt_active = false;
-        Serial.println("[WDT] Fermato");
-    }
-}
-
-void wdtKick(void)
-{
-    if (wdt_active) {
-        api.system.timer.stop(WDT_TIMER_ID);
-    }
-    api.system.timer.start(WDT_TIMER_ID, WDT_TIMEOUT_MS, NULL);
-    wdt_active = true;
-}
-
-bool wdtInit(void)
-{
-    if (!api.system.timer.create(WDT_TIMER_ID, wdtCallback, RAK_TIMER_ONESHOT)) {
-        Serial.println("[WDT] ERRORE creazione timer!");
-        return false;
-    }
-    Serial.println("[WDT] Timer creato (one-shot, pronto)");
-    return true;
-}
-
-
-// =====================================================================
-// I2C BUS RECOVERY
+// I2C BUS RECOVERY (SDA=P0.13, SCL=P0.14)
 // =====================================================================
 
 bool i2cBusRecovery(void)
@@ -186,7 +92,7 @@ bool i2cBusRecovery(void)
     pinMode(I2C_SCL_PIN, OUTPUT);
 
     if (digitalRead(I2C_SDA_PIN) == LOW) {
-        Serial.println("[I2C] SDA bloccata LOW! Recovery in corso...");
+        Serial.println("[I2C] SDA bloccata LOW! Recovery...");
 
         for (int i = 0; i < 9; i++) {
             digitalWrite(I2C_SCL_PIN, HIGH);
@@ -205,56 +111,36 @@ bool i2cBusRecovery(void)
 
         pinMode(I2C_SDA_PIN, INPUT_PULLUP);
         if (digitalRead(I2C_SDA_PIN) == HIGH) {
-            Serial.println("[I2C] Recovery OK - SDA rilasciata");
-            pinMode(I2C_SDA_PIN, INPUT_PULLUP);
-            pinMode(I2C_SCL_PIN, INPUT_PULLUP);
-            delay(10);
-            return true;
+            Serial.println("[I2C] Recovery OK");
         } else {
-            Serial.println("[I2C] Recovery FALLITA - SDA ancora LOW");
-            pinMode(I2C_SDA_PIN, INPUT_PULLUP);
-            pinMode(I2C_SCL_PIN, INPUT_PULLUP);
-            delay(10);
-            return false;
+            Serial.println("[I2C] Recovery FALLITA");
         }
     } else {
         Serial.println("[I2C] Bus OK (SDA HIGH)");
-        pinMode(I2C_SDA_PIN, INPUT_PULLUP);
-        pinMode(I2C_SCL_PIN, INPUT_PULLUP);
-        delay(10);
-        return true;
     }
+
+    pinMode(I2C_SDA_PIN, INPUT);
+    pinMode(I2C_SCL_PIN, INPUT);
+    delay(10);
+    return (digitalRead(I2C_SDA_PIN) == HIGH);
 }
 
 bool i2cBusRecoveryWithRetry(void)
 {
     const unsigned int retryDelays[I2C_RECOVERY_MAX_RETRIES] = {200, 500, 1000};
-
     for (int attempt = 0; attempt < I2C_RECOVERY_MAX_RETRIES; attempt++) {
-        Serial.print("[I2C] Tentativo recovery ");
-        Serial.print(attempt + 1);
-        Serial.print("/");
-        Serial.println(I2C_RECOVERY_MAX_RETRIES);
-
-        if (i2cBusRecovery()) {
-            return true;
-        }
-
-        if (attempt < I2C_RECOVERY_MAX_RETRIES - 1) {
-            Serial.print("[I2C] Attendo ");
-            Serial.print(retryDelays[attempt]);
-            Serial.println(" ms prima di riprovare...");
-            delay(retryDelays[attempt]);
-        }
+        Serial.print("[I2C] Tentativo "); Serial.print(attempt + 1);
+        Serial.print("/"); Serial.println(I2C_RECOVERY_MAX_RETRIES);
+        if (i2cBusRecovery()) return true;
+        if (attempt < I2C_RECOVERY_MAX_RETRIES - 1) delay(retryDelays[attempt]);
     }
-
-    Serial.println("[I2C] !!! Recovery FALLITA dopo tutti i tentativi !!!");
+    Serial.println("[I2C] Recovery FALLITA dopo tutti i tentativi!");
     return false;
 }
 
 
 // =====================================================================
-// BATTERIA
+// BATTERIA (nRF52840 ADC 12-bit, Vref 3.0V)
 // =====================================================================
 
 uint16_t readBatteryMV(void)
@@ -295,43 +181,30 @@ void printBootDiagnostic(void)
 {
     Serial.println();
     Serial.println("=============================================");
-    Serial.println("  DIAGNOSTICA BOOT v6.6");
+    Serial.println("  DIAGNOSTICA BOOT v7.2 (nRF52840)");
     Serial.println("=============================================");
 
     if (diag.magic == 0xDEADBEEF) {
-        Serial.print("  [BOOT] LAST_PHASE   = ");
-        Serial.println(phaseNames[diag.lastPhase]);
-        Serial.print("  [BOOT] LAST_CYCLE   = ");
-        Serial.println(diag.cycleCount);
-        Serial.print("  [BOOT] TOTAL_TX_OK  = ");
-        Serial.println(diag.successfulTx);
-        Serial.print("  [BOOT] LAST_TX      = ");
-        Serial.println(diag.lastTxResult ? "OK" : "FAIL");
-        Serial.print("  [BOOT] TX_FAIL_CNT  = ");
-        Serial.println(diag.lastTxFailCount);
-        Serial.print("  [BOOT] LAST_BAT     = ");
-        Serial.print(diag.lastBatteryMv);
-        Serial.println(" mV");
-        Serial.print("  [BOOT] RESET_REASON = ");
-
+        Serial.print("  [BOOT] LAST_PHASE   = "); Serial.println(phaseNames[diag.lastPhase]);
+        Serial.print("  [BOOT] LAST_CYCLE   = "); Serial.println(diag.cycleCount);
+        Serial.print("  [BOOT] TOTAL_TX_OK  = "); Serial.println(diag.successfulTx);
+        Serial.print("  [BOOT] LAST_TX      = "); Serial.println(diag.lastTxResult ? "OK" : "FAIL");
+        Serial.print("  [BOOT] TX_FAIL_CNT  = "); Serial.println(diag.lastTxFailCount);
+        Serial.print("  [BOOT] LAST_BAT     = "); Serial.print(diag.lastBatteryMv); Serial.println(" mV");
         if (diag.wdtTriggered) {
-            Serial.println("WDT TIMEOUT");
-            Serial.print("  [BOOT] WDT scattato durante: ");
-            Serial.println(phaseNames[diag.lastPhase]);
+            Serial.println("  [BOOT] RESET = WDT TIMEOUT");
         } else if (diag.lastPhase == PHASE_SLEEPING) {
-            Serial.println("WAKE FROM SLEEP (normale)");
+            Serial.println("  [BOOT] RESET = WAKE FROM SLEEP");
         } else {
-            Serial.println("SCONOSCIUTO (power cycle o crash)");
+            Serial.println("  [BOOT] RESET = SCONOSCIUTO");
         }
     } else {
         Serial.println("  [BOOT] Prima accensione o power cycle");
-        Serial.println("  [BOOT] Nessun dato diagnostico precedente");
     }
 
     Serial.println("=============================================");
     Serial.println();
 
-    // Inizializza per questa sessione
     diag.magic = 0xDEADBEEF;
     diag.lastPhase = PHASE_BOOT;
     diag.cycleCount = 0;

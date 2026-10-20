@@ -1,244 +1,95 @@
 
+// =====================================================================
+// memory_monitor.h - STUB MEMORY MONITOR per nRF52840 (256 KB SRAM)
+// =====================================================================
+// MYRUMINET - Sensore Gas Stalla v7.2
+// RAK4630 (nRF52840) / RAK19007 Rev.C
+//
+// Sul STM32WLE5 (64 KB) il memory monitor era CRITICO perche' il
+// LoRaWAN stack lasciava solo ~68-92 byte liberi di heap.
+// Sul nRF52840 (256 KB) il margine e' enormemente piu' ampio.
+//
+// Questo stub fornisce le stesse API del vecchio memory_monitor.h
+// ma usa il gap heap-stack per stimare la RAM libera.
+// =====================================================================
+
 #ifndef MEMORY_MONITOR_H
 #define MEMORY_MONITOR_H
 
 // =====================================================================
-// memory_monitor.h - MONITORAGGIO HEAP E STACK
-// =====================================================================
-// RAK3172-E (STM32WLE5CCU6)
-// RAM: 64 KB (0x20000000 - 0x20010000)
-//
-// NOTA IMPORTANTE:
-//   Su RUI3/STM32WLE5, mallinfo() riporta solo l'heap dinamico
-//   che e' MOLTO piccolo (~248 bytes). La maggior parte della RAM
-//   e' usata come stack (~64 KB). Questo e' NORMALE.
-//   La soglia critica deve essere basata su ENTRAMBI heap + stack.
-//
-// Fornisce:
-//   - memGetFreeHeap()   -> bytes liberi nell'heap
-//   - memGetUsedHeap()   -> bytes usati nell'heap
-//   - memGetFreeStack()  -> bytes liberi nello stack
-//   - memPrintInfo()     -> stampa completa su seriale
-//   - memGetFreeHeapStr() -> stringa per JSON log
+// STIMA RAM LIBERA (heap-stack gap)
 // =====================================================================
 
-#include <malloc.h>
+extern "C" char *sbrk(int incr);
 
-// Indirizzo fine RAM STM32WLE5 (64 KB)
-#define RAM_START   0x20000000
-#define RAM_END     0x20010000
-#define RAM_SIZE    (RAM_END - RAM_START)   // 65536 bytes
+static uint32_t mem_heap_free_boot = 0;
+static uint32_t mem_heap_min       = 0xFFFFFFFF;
 
-// Soglie critiche
-// HEAP: su RUI3 l'heap dinamico e' ~248 bytes totali,
-//       quindi 16 bytes liberi e' il minimo accettabile
-// STACK: 2 KB e' il minimo per operazioni LoRaWAN + sensori
-#define MEM_HEAP_CRITICAL    16      // 16 bytes heap minimo
-#define MEM_STACK_CRITICAL   2048    // 2 KB stack minimo
-
-
-// =====================================================================
-// VARIABILI PER TRACKING
-// =====================================================================
-
-static uint32_t mem_heap_free_min = 0xFFFFFFFF;   // Minimo heap libero mai visto
-static uint32_t mem_heap_free_boot = 0;            // Heap libero al boot (baseline)
-static bool     mem_baseline_set = false;
-
-
-// =====================================================================
-// FUNZIONI HEAP (via mallinfo - standard C)
-// =====================================================================
-
-// Heap libero in bytes
-static inline uint32_t memGetFreeHeap(void)
+static uint32_t memGetFreeHeap(void)
 {
-    struct mallinfo mi = mallinfo();
-    return mi.fordblks;
+    char stackVar;
+    char *heapEnd = (char *)sbrk(0);
+    if (heapEnd == (char *)-1) return 0;
+    uint32_t freeBytes = (uint32_t)(&stackVar - heapEnd);
+    return freeBytes;
 }
 
-// Heap in uso in bytes
-static inline uint32_t memGetUsedHeap(void)
+static uint32_t memGetFreeStack(void)
 {
-    struct mallinfo mi = mallinfo();
-    return mi.uordblks;
+    return memGetFreeHeap();  // Sul nRF52840 e' la stessa metrica
 }
 
-// Heap totale arena in bytes
-static inline uint32_t memGetTotalHeap(void)
+static uint32_t memGetUsedHeap(void)
 {
-    struct mallinfo mi = mallinfo();
-    return mi.arena;
+    return 0;  // Non disponibile senza mallinfo
 }
 
-
-// =====================================================================
-// FUNZIONE STACK (via stack pointer)
-// =====================================================================
-
-// Stima bytes liberi nello stack
-static inline uint32_t memGetFreeStack(void)
+static void memUpdateMin(void)
 {
-    volatile uint32_t sp;
-    __asm__ volatile("mov %0, sp" : "=r"(sp));
-
-    // Lo stack cresce verso il basso su ARM Cortex-M
-    // Il "free" reale e' tra la fine dell'heap e lo stack pointer
-    struct mallinfo mi = mallinfo();
-    uint32_t heap_end = RAM_START + mi.arena;
-
-    if (sp > heap_end) {
-        return sp - heap_end;
+    uint32_t current = memGetFreeHeap();
+    if (current < mem_heap_min) {
+        mem_heap_min = current;
     }
-    return 0;  // Stack overflow imminente!
 }
 
-
-// =====================================================================
-// BASELINE (chiamare una volta nel setup)
-// =====================================================================
-
-void memSetBaseline(void)
+static void memSetBaseline(void)
 {
     mem_heap_free_boot = memGetFreeHeap();
-    mem_heap_free_min = mem_heap_free_boot;
-    mem_baseline_set = true;
-
-    Serial.print("[MEM] Baseline heap libero: ");
-    Serial.print(mem_heap_free_boot);
-    Serial.println(" bytes");
+    mem_heap_min       = mem_heap_free_boot;
 }
 
-
-// =====================================================================
-// UPDATE MINIMO (chiamare ad ogni ciclo)
-// =====================================================================
-
-void memUpdateMin(void)
+static uint32_t memGetFreeHeapForLog(void)
 {
-    uint32_t free_now = memGetFreeHeap();
-    if (free_now < mem_heap_free_min) {
-        mem_heap_free_min = free_now;
-    }
-}
-
-
-// =====================================================================
-// STAMPA COMPLETA SU SERIALE
-// =====================================================================
-
-void memPrintInfo(const char *label)
-{
-    struct mallinfo mi = mallinfo();
-    uint32_t free_stack = memGetFreeStack();
-    uint32_t free_heap = mi.fordblks;
-    uint32_t used_heap = mi.uordblks;
-
-    Serial.println();
-    Serial.print("[MEM] --- ");
-    Serial.print(label);
-    Serial.println(" ---");
-    Serial.print("[MEM] Heap totale (arena): ");
-    Serial.print(mi.arena);
-    Serial.println(" bytes");
-    Serial.print("[MEM] Heap in uso:         ");
-    Serial.print(used_heap);
-    Serial.println(" bytes");
-    Serial.print("[MEM] Heap libero:         ");
-    Serial.print(free_heap);
-    Serial.println(" bytes");
-    Serial.print("[MEM] Heap libero minimo:  ");
-    Serial.print(mem_heap_free_min);
-    Serial.println(" bytes");
-
-    if (mem_baseline_set) {
-        int32_t delta = (int32_t)free_heap - (int32_t)mem_heap_free_boot;
-        Serial.print("[MEM] Delta dal boot:      ");
-        Serial.print(delta);
-        Serial.print(" bytes (");
-        if (delta < 0) {
-            Serial.print("LEAK? -");
-            Serial.print(-delta);
-        } else if (delta > 0) {
-            Serial.print("OK +");
-            Serial.print(delta);
-        } else {
-            Serial.print("stabile");
-        }
-        Serial.println(")");
-    }
-
-    Serial.print("[MEM] Stack libero:        ");
-    Serial.print(free_stack);
-    Serial.println(" bytes");
-    Serial.print("[MEM] RAM totale:          ");
-    Serial.print(RAM_SIZE);
-    Serial.println(" bytes (64 KB)");
-    Serial.println();
-}
-
-
-// =====================================================================
-// VALORI PER JSON LOG
-// =====================================================================
-
-// Ritorna heap libero corrente (per inserimento nel JSON)
-static inline uint32_t memGetFreeHeapForLog(void)
-{
-    memUpdateMin();
     return memGetFreeHeap();
 }
 
-// Ritorna heap libero minimo (per inserimento nel JSON)
-static inline uint32_t memGetMinHeapForLog(void)
+static uint32_t memGetMinHeapForLog(void)
 {
-    return mem_heap_free_min;
+    return mem_heap_min;
 }
 
-
-// =====================================================================
-// CHECK CRITICO (basato su heap + stack)
-// =====================================================================
-// Su RUI3/STM32WLE5:
-//   - Heap dinamico e' ~248 bytes totali (NORMALE, non e' un leak)
-//   - Stack e' ~64 KB (qui risiede la maggior parte dei dati)
-//   - Il check critico deve guardare ENTRAMBI
-
-bool memCheckCritical(void)
+static bool memCheckCritical(void)
 {
-    uint32_t free_heap = memGetFreeHeap();
-    uint32_t free_stack = memGetFreeStack();
-    bool critical = false;
+    uint32_t free = memGetFreeHeap();
+    return (free < 1024);  // 1 KB threshold (generoso su 256 KB)
+}
 
-    if (free_heap < MEM_HEAP_CRITICAL) {
-        Serial.println("[MEM] !!! HEAP CRITICO !!!");
-        Serial.print("[MEM] Solo ");
-        Serial.print(free_heap);
-        Serial.print(" / ");
-        Serial.print(MEM_HEAP_CRITICAL);
-        Serial.println(" bytes minimi!");
-        critical = true;
-    }
+static void memPrintInfo(const char *label)
+{
+    uint32_t free = memGetFreeHeap();
+    memUpdateMin();
 
-    if (free_stack < MEM_STACK_CRITICAL) {
-        Serial.println("[MEM] !!! STACK CRITICO !!!");
-        Serial.print("[MEM] Solo ");
-        Serial.print(free_stack);
-        Serial.print(" / ");
-        Serial.print(MEM_STACK_CRITICAL);
-        Serial.println(" bytes minimi!");
-        critical = true;
-    }
-
-    if (!critical) {
-        Serial.print("[MEM] OK - Heap: ");
-        Serial.print(free_heap);
-        Serial.print("B | Stack: ");
-        Serial.print(free_stack);
-        Serial.println("B");
-    }
-
-    return critical;
+    Serial.print("[MEM] ");
+    Serial.print(label);
+    Serial.print(" | Free: ");
+    Serial.print(free);
+    Serial.print(" bytes | Min: ");
+    Serial.print(mem_heap_min);
+    Serial.print(" bytes | Boot: ");
+    Serial.print(mem_heap_free_boot);
+    Serial.print(" | Delta: ");
+    int32_t delta = (int32_t)free - (int32_t)mem_heap_free_boot;
+    Serial.println(delta);
 }
 
 
